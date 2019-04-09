@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+import argparse
+import logging
+import multiprocessing
+import os
+import subprocess
+import sys
+import threading
+from typing import BinaryIO, List, NoReturn
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Message Passing Analyzer')
+    parser.add_argument('-p', action='append', nargs=argparse.ZERO_OR_MORE,
+                        default=[], type=int,
+                        help='PID to monitor',
+                        metavar='PID', dest='pids')
+    parser.add_argument('-v', action='store_true',
+                        help='Verbose output')
+    parser.add_argument('cmd', nargs=argparse.REMAINDER,
+                        help='Command to run and monitor')
+    return parser.parse_args()
+
+
+def process_stap_stdout(stdout: BinaryIO) -> None:
+    for s in stdout:
+        sys.stderr.write(s.decode())
+
+
+def start_stap(pids: List[int], stap_ready: multiprocessing.Event) -> \
+        (multiprocessing.Process, threading.Thread):
+    mpa_stp = os.path.join(os.path.dirname(__file__), 'mpa.stp')
+    logging.debug('Starting SystemTap script...')
+    stap_process = subprocess.Popen(
+        ['stdbuf', '-oL', 'stap', mpa_stp] + [str(pid) for pid in pids],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE)
+    line = stap_process.stdout.readline()
+    if line != b'# ready\n':
+        raise Exception('Unexpected SystemTap script output: %s' % line)
+    logging.debug('SystemTap script is running.')
+    stap_ready.set()
+    stdout_thread = threading.Thread(
+        target=process_stap_stdout,
+        args=(stap_process.stdout,))
+    stdout_thread.start()
+    return stap_process, stdout_thread
+
+
+def exec_child(cmd: List[str], stap_ready: multiprocessing.Event) -> NoReturn:
+    logging.debug('Waiting for SystemTap script...')
+    stap_ready.wait()
+    logging.debug('Executing %s...', cmd[0])
+    os.execvp(cmd[0], cmd)
+
+
+def main() -> int:
+    args = parse_args()
+    if args.v:
+        logging.basicConfig(level=logging.DEBUG)
+    if len(args.pids) == 0 and len(args.cmd) == 0:
+        print('Nothing to do', file=sys.stderr)
+        sys.exit(1)
+    pids = list(args.pids)
+    stap_ready = multiprocessing.Event()
+    if len(args.cmd) == 0:
+        child = None
+    else:
+        logging.debug('Starting child process...')
+        child = multiprocessing.Process(
+            target=exec_child,
+            args=(args.cmd, stap_ready))
+        child.start()
+        logging.debug('Child process started, pid = %d.', child.pid)
+        pids.append(child.pid)
+    try:
+        stap_process, stdout_thread = start_stap(pids, stap_ready)
+        try:
+            if child is None:
+                print(
+                    '* Monitoring... (Press CTRL+C to quit)',
+                    file=sys.stderr)
+                try:
+                    threading.Event().wait()
+                except KeyboardInterrupt:
+                    pass
+                returncode = 0
+            else:
+                logging.debug('Waiting for child process...')
+                child.join()
+                returncode = child.exitcode
+                child = None
+        finally:
+            logging.debug('Terminating SystemTap script...')
+            stap_process.terminate()
+            stap_process.wait()
+            stdout_thread.join()
+    finally:
+        if child is not None:
+            logging.debug('Terminating child process...')
+            child.terminate()
+            child.join()
+    return returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,9 @@
+global pids
+
+probe begin {
+    for (i = 1; i <= argc; i++) {
+        pid = strtol(argv[i], 10)
+        pids[pid] = pid
+    }
+    printf("# ready\n")
+}
